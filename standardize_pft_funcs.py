@@ -568,21 +568,25 @@ def find_duplicates(df, subset, col_name):
 # Pandas row-wise functions to use with .apply()
 ##########################################################################################
 
-# function to get genus and species name
 def get_substrings(row):
+
+    # NOTE: DO NOT modify this code to change the source words in any way
+    # because then you won't be able to match new names to originals later
     
-    # extract genus + species name
-    words = row.split()[:2]
-    if 'species' in words: # if just genus
-        string = words[0]
-    elif 'Unknown' in words: # if unknown species
-        string = words[1]
+    if not isinstance(row, str) or not row.strip():  # Handle empty or non-string inputs
+        return None
+    
+    words = row.split()[:2] # assumed output: [genus, species]
+    lowercase_words = [word.lower() for word in words]
+    
+    if len(words) == 0:  # edge case: empty list
+        return None
+    elif len(words) == 1 or 'species' in lowercase_words:  # Edge case: only one word present
+        return words[0]
+    elif lowercase_words[0] == 'unknown' and len(words) >1:  # Handling 'Unknown' case
+        return words[1]
     else:
-        string = ' '.join(words)
-        
-    # remove potential brackets in string
-    string = string.replace('[','').replace(']','')
-    return string
+        return ' '.join(words[:2]) # return the words
 
 
 # function get genus name only
