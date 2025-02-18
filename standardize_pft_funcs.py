@@ -343,59 +343,78 @@ def add_standard_cols(df):
     df[addcols] = np.nan
     return df
 
+def neon_plot_centroids(dfs, file_paths, DIR):
+    """
+    Main function for NEON data that extracts the centroid coordinates 
+    for the 1-meter-level plots. This data has to be queried online. 
+    The coordinates provided in the .csv are for the larger 40-meter plot.
 
-def neon_plot_centroids(dfs, DIR):
-    
-    """
-    Main function for NEON data that is used to extract
-    the centroid coordinates for the 1-meter-level plots;
-    this data has to be queried online. The coordinates
-    provided in the .csv are for the larger 40-meter plot.
-    This function is not generalizable at all, apologies.
-    
-    dfs   (list): list containing pandas dataframes with neon
-                  fcover data (pandas dataframes created from
-                  the TOOL.csv and BARR.csv
-    DIR (string): path to the output .csv that combines TOOL
-                  and BARR .csvs
+    dfs        (list): List containing pandas DataFrames with NEON fCover data.
+    file_paths (list): List of file paths corresponding to the DataFrames.
+    DIR       (string): Path to the output directory where the combined .csv will be saved.
     """
     
-    # create name column to exract plot centroids
+    # Combine all dataframes into one
     df = pd.concat(dfs)
     df.reset_index(inplace=True, drop=True)
     df['name'] = df.namedLocation + '.' + df.subplotID
-    
-    # get subplot lat/lon from server
+
+    # Extract source names (e.g., TOOL, BARR) and years from file paths
+    source_names = set()
+    years = set()
+
+    for filepath in file_paths:
+        filename = os.path.basename(filepath)
+        filename_parts = filename.split('.')
+        
+        # 'NEON', 'D18', 'BARR', 'DP1', '10058', '001', 'div_1m2Data', '2016-07', 'basic', '20241118T015606Z', 'csv'
+        # Extract the site name (SITE)
+        source_name = filename_parts[2]
+        source_names.add(source_name)
+
+        # Extract the year (YYYY-MM)
+        year = filename_parts[7].split('-')[0]
+        years.add(year)
+
+    # Construct output filename
+    source_str = "_".join(sorted(source_names)) if source_names else "NOSOURCE"
+    year_range = f"{min(years)}-{max(years)}" if years else "NOYEAR"
+    output_file = f"neon_cover_{source_str}_1m2Data_{year_range}.csv"
+
+    # Get subplot lat/lon from server
     requests_dict = {}
     plots = df['name'].to_list()
     url = 'http://data.neonscience.org/api/v0/locations/'
     locs = []
 
     for plot in plots:
-
-        # only get response when the request is new
         response = None
-        if plot not in list(requests_dict.keys()):
-            response = requests.get(url + plot)
-            requests_dict[plot] = response
+        if plot not in requests_dict:
+            print(url + plot)
+            try:
+                response = requests.get(url + plot)
+                requests_dict[plot] = response
+            except Exception as e:
+                print('Exception occurred: ', e)
         else:
             response = requests_dict[plot]
-        # print(url + plot, end='\r')
 
-        # extract lat/lon
+        # Extract lat/lon
         try:
             lat = response.json()['data']['locationDecimalLatitude']
             lon = response.json()['data']['locationDecimalLongitude']
         except Exception as e:
-            # print(response.content)
-            print(e)
+            print('Exception occurred: ', e)
             lat, lon = None, None
-        locs.append([lat,lon])
+        locs.append([lat, lon])
         
-    # add coordinate data to rows
+    # Add coordinate data to rows
     coords = pd.DataFrame(locs, columns=['subplot_lat','subplot_lon'])
     new_df = pd.concat([df, coords], axis=1)
-    new_df.to_csv(DIR + '/NEON.D18.TOOLBARR.DP1.10058.001.div_1m2Data.2021.csv')
+
+    # Save output file
+    new_df.to_csv(os.path.join(DIR, output_file), index=False)
+    print(f"Saved file: {output_file}")
     
 
 def leaf_retention_df(path):
