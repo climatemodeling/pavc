@@ -1,151 +1,185 @@
-### AVA ###
-
-def warn(*args, **kwargs):
-    pass
-import warnings
-warnings.warn = warn
-
-# load cover file
-p = '/mnt/poseidon/remotesensing/arctic/data/training/Test_05/temp/'
-f = 'AVA_fcover_child.csv'
-akava = pd.read_csv(p + f)
-
-# only plots with very small sizes need to be processed, 
-# the other remains the same, discarding all plots earlier than 2010
-akava['plot_radius_m'].astype(float)
-akava_small_fcover = akava[(akava['plot_radius_m']<10) &  (akava['year']>=2010)]
-akava_large_fcover = akava[(akava['plot_radius_m']>=10) &  (akava['year']>=2010)]
-
-selected_columns = ['Site Code','year','latitude', 'longitude', 'source', 'subsource', 'plot_radius_m']
-akava_small = akava_small_fcover[selected_columns]
-# akava_small = akava.fillna(0)
-akava_small.head()
-
-#### transform geographic to utm so that distance caculation is more intuitive
+import pandas as pd
+import numpy as np
 from pyproj import Transformer
-src_crs = "EPSG:4326"
-target_crs = "EPSG:32606"
-transformer = Transformer.from_crs(src_crs, target_crs)
+import warnings
+ 
+# suppress warnings
+warnings.filterwarnings('ignore')
 
-lon = akava_small['longitude'].to_numpy()
-lat = akava_small['latitude'].to_numpy()
+# parameters
+src = 'akveg'
+dst = 'VEG'
+vers = '03'
+wdir = '../data/training/Test_06/fcover'
+dist_thres = 55          # meters
+small_area_thr = 314     # m² threshold for small plots
 
-#### store the projected coords
-projcoords = []   
-for i in range(0,akava_small.shape[0]):
-    xcoord, ycoord = lon[i],lat[i]
-    projcoords.append(transformer.transform(ycoord,xcoord))
-    
-#### calculate the distance matrix of all small plots (for examination)
-from scipy.spatial.distance import cdist
-coord = np.array(projcoords)
-dist_mat = cdist(coord, coord, 'euclidean')
-# dist_mat[:3,:] <= 60
+# --- 0) Set export naming schema ---
+schema = {'surveyYear':'year',
+          'latitudeY':'latitude',
+          'longitudeX':'longitude',
+          'dataSource':'source',
+          'dataSubsource':'subsource',
+          'plotArea':'plot area m2',
+          'plotShape':'plot shape',
+          'surveyMethod':'field sampling method',
+          'fcoverScale':'cover measurement',
+          'baregroundCover':'bare ground top cover (%)',
+          'bryophyteCover':'bryophyte total cover (%)',
+          'deciduousShrubCover':'deciduous shrub total cover (%)',
+          'deciduousTreeCover':'deciduous tree total cover (%)',
+          'evergreenShrubCover':'evergreen shrub total cover (%)',
+          'evergreenTreeCover':'evergreen tree total cover (%)',
+          'forbCover':'forb total cover (%)',
+          'graminoidCover':'graminoid total cover (%)',
+          'lichenCover':'lichen total cover (%)',
+          'litterCover':'litter total cover (%)',
+          'nonvascularCover':'non-vascular total cover (%)',
+          'otherCover':'other total cover (%)',
+          'waterCover':'water top cover (%)'}
 
-### group pixels/plots based on their euclidean distance
-def group_pixels_by_distance(pixel_data, distance_threshold):
-    """
-        pixel_data: ndarray of coordinate pair: n by 2, default is utm projection
-        distance_threshold: threshold used for grouping, default is 60m
-        
-        return:
-        a list of values indicating the group id of each pixel
-    
-    """
-    cluster_id = 0
-    pixel_clusters = {}
-   
-    def expand_cluster(pixel, cluster_id):
-        if pixel_clusters.get(cluster_id) is None:
-            pixel_clusters[cluster_id] = []
-       
-        pixel_clusters[cluster_id].append(pixel)
 
-    cluster_array = np.full(len(pixel_data), -1)  # Initialize with -1 (unassigned)
-   
-    for i, pixel in enumerate(pixel_data):
-        assigned = False
-       
-        for c_id, cluster_pixels in pixel_clusters.items():
-            cluster_pixels = np.array(cluster_pixels)
-            distances = np.linalg.norm(cluster_pixels - pixel, axis=1)
-            if np.any(distances <= distance_threshold):
-                expand_cluster(pixel, c_id)
-                assigned = True
-                cluster_array[i] = c_id
+# --- 1) Read & export child_data ---
+# read cover and plot info
+override_dtype = {'plotVisit': str}
+cover = pd.read_csv(f'{src}/output_data/{src}_standard_pft_fcover.csv', dtype=override_dtype)
+info = pd.read_csv(f'{src}/output_data/{src}_plot_info.csv', dtype=override_dtype)
+info = info[[
+    'plotVisit','surveyYear',
+    'latitudeY','longitudeX','dataSource','dataSubsource',
+    'plotArea','plotShape','surveyMethod','fcoverScale'
+]]
+
+# merge and filter by year ≥ 2010
+child = pd.merge(cover, info, on='plotVisit', how='outer')
+child = child[child['surveyYear'] >= 2010].reset_index(drop=True)
+
+# export
+child_out = child.copy()
+child_out = child_out.rename(columns=schema)
+child_out.index = child_out['plotVisit']
+child_out.index.name = 'Site Code'
+child_out = child_out.drop(columns=['plotVisit'])
+child_out.to_csv(f'{wdir}/{dst}_fcover_child_{vers}.csv')
+
+# project to UTM once, and stash coords on every row
+transformer = Transformer.from_crs("EPSG:4326", "EPSG:32606", always_xy=True)
+xy = np.array([transformer.transform(lon, lat)
+               for lon, lat in zip(child.longitudeX, child.latitudeY)])
+child['x'], child['y'] = xy[:,0], xy[:,1]
+
+# split small vs large
+child_small = child[child.plotArea < small_area_thr].copy()
+child_large = child[child.plotArea >= small_area_thr].copy()
+
+# --- 2) cluster small plots by distance ---
+def group_by_distance(points, threshold):
+    labels = np.full(len(points), -1, dtype=int)
+    clusters = {}
+    cid = 0
+    for i, pt in enumerate(points):
+        for k, members in clusters.items():
+            if np.any(np.linalg.norm(np.vstack(members) - pt, axis=1) <= threshold):
+                clusters[k].append(pt)
+                labels[i] = k
                 break
-       
-        if not assigned:
-            expand_cluster(pixel, cluster_id)
-            cluster_array[i] = cluster_id
-            cluster_id += 1
+        else:
+            clusters[cid] = [pt]
+            labels[i] = cid
+            cid += 1
+    return labels
 
-    return cluster_array
+if not child_small.empty:
+    coords = child_small[['x','y']].to_numpy()
+    child_small['group_id'] = group_by_distance(coords, dist_thres)
+else:
+    child_small['group_id'] = np.array([], dtype=int)
 
-dist_thres = 55
-coord = np.array(projcoords)  ## UTM coords, unit is meter
-group = group_pixels_by_distance(coord, dist_thres)
+# --- 3) aggregate small-plot clusters, keeping all coords in lists ---
+cover_cols = [c for c in child_small.columns if 'Cover' in c]
+agg = child_small.groupby(
+    ['group_id','surveyYear','dataSource'], as_index=False
+).agg(
+    latitudeY       = ('latitudeY','mean'),
+    longitudeX      = ('longitudeX','mean'),
+    x_coords        = ('x',      lambda s: list(s)),
+    y_coords        = ('y',      lambda s: list(s)),
+    child_plotVisit = ('plotVisit', list),
+    plotArea_orig   = ('plotArea', list),
+    plotShape_orig  = ('plotShape', list),
+    # compute the MOST FREQUENT string in each group
+    dataSubsource   = (
+        'dataSubsource',
+        lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0]
+    ),
+    surveyMethod    = (
+        'surveyMethod',
+        lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0]
+    ),
+    fcoverScale     = (
+        'fcoverScale',
+        lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0]
+    ),
+    **{col: (col,'mean') for col in cover_cols}
+)
 
-### add the group id to df for aggregation
-akava_small['group_id'] = group
+# --- recalc area & shape with list comprehensions instead of apply() ---
+# helper for max-pairwise distance (unchanged)
+def max_pairwise_dist(xs, ys):
+    pts = np.column_stack((xs, ys))
+    if pts.shape[0] < 2:
+        return 0.0
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+    return d.max()
 
-groups = akava_small.groupby(['group_id', 
-                              'year', 'source']).agg({'latitude':'mean',
-                                            'longitude':'mean',
-                                            'Site Code':list,
-                                            'plot_radius_m':list,
-                                            'subsource':set})
+# helper for computing each parent’s area
+def compute_parent_area(xs, ys, orig_list):
+    if len(xs) < 2:
+        return orig_list[0]
+    dmax = max_pairwise_dist(xs, ys)
+    return np.pi * (dmax / 2) ** 2
 
-def get_plot_size(rowlst):
-    if len(rowlst) == 1:
-        val = rowlst[0]
-    else:
-        val = 55
-    return val
-groups['plot_radius_m'] = groups['plot_radius_m'].apply(lambda row: get_plot_size(row))
-groups
+# now build the new plotArea column
+agg['plotArea'] = [
+    compute_parent_area(xs, ys, orig) 
+    for xs, ys, orig in zip(agg.x_coords, agg.y_coords, agg.plotArea_orig)
+]
 
-groups2 = groups.explode('Site Code')
-groups2.reset_index(inplace=True)
-groups2['parent_id'] = (groups2['group_id'].astype(str) + 
-                        '_' + groups2['year'].astype(str) +
-                        '_' + groups2['source'])
-groups2.rename(columns={'latitude':'parent_latitude',
-                        'longitude':'parent_longitude'},
-               inplace=True)
-groups2.drop(columns=['group_id', 'year', 'source', 'subsource'], inplace=True)
-groups2
+# and similarly set shape = 'circle' whenever we merged >1 child
+agg['plotShape'] = [
+    'circle' if len(xs) > 1 else orig_shape[0]
+    for xs, orig_shape in zip(agg.x_coords, agg.plotShape_orig)
+]
 
-groups2.set_index('Site Code', inplace=True)
-asf = akava_small_fcover.set_index('Site Code')
-asf.drop(columns=['plot_radius_m'], inplace=True)
-joined = pd.concat([asf, groups2], axis=1)
-joined.columns
+# build plotVisit ID
+agg['plotVisit'] = np.where(
+    agg.child_plotVisit.str.len() > 1,
+    agg.group_id.astype(str)
+      + '_' + agg.surveyYear.astype(str)
+      + '_' + agg.dataSource,
+    agg.child_plotVisit.str[0]
+)
 
-info_cols = ['parent_latitude', 'parent_longitude', 'plot_radius_m'] #create parent coord by finding mean
-data_cols = [col for col in joined.columns if 'cover (%)' in col]
-anci_cols = set(joined.columns) - set(data_cols) - set(info_cols)
+# finalize parents_small
+parents_small = agg.set_index('plotVisit').drop(
+    columns=['group_id','plotArea_orig','plotShape_orig','x_coords','y_coords']
+)
 
-info_dict = dict.fromkeys(info_cols, 'mean')
-data_dict = dict.fromkeys(data_cols, 'mean')
-anci_dict = dict.fromkeys(anci_cols, set)
-d = {**data_dict, **info_dict, **anci_dict}
+# --- 4) large plots pass through as before ---
+parents_large = child_large.set_index('plotVisit')
 
-parent_plots = joined.groupby('parent_id').agg(d)
+# --- 5) concatenate and export ---
+parents = pd.concat([parents_small, parents_large], axis=0)
+parents = parents.drop(columns=['x','y'], errors=True)
+parents.index.name = 'plotVisit'
 
-parent_plots.drop(columns=['latitude', 'longitude', 'parent_id', 
-                           'source'],
-                 inplace=True)
+# reorder columns
+cover_cols_sorted = sorted([c for c in parents.columns if 'Cover' in c])
+info_cols_sorted  = [c for c in parents.columns if c not in cover_cols_sorted]
+parents = parents[cover_cols_sorted + info_cols_sorted]
 
-parent_plots['year'] = parent_plots['year'].explode()
-parent_plots['source'] = 'AKAVA'
-parent_plots['subsource'] = parent_plots['subsource'].apply(list)
-parent_plots.rename(columns={'Site Code':'child_site_codes',
-                             'parent_longitude':'longitude',
-                             'parent_latitude':'latitude'}, 
-                    inplace=True)
-parent_plots.index.name = 'Site Code'
-
-p = '/mnt/poseidon/remotesensing/arctic/data/training/Test_05/temp/'
-f = 'AVA_fcover_parent.csv'
-parent_plots.to_csv(p + f)
+# export
+parents_out = parents.copy()
+parents_out = parents_out.rename(columns=schema)
+parents_out.index.name = 'Site Code'
+parents_out.to_csv(f'{wdir}/{dst}_fcover_parent_{vers}.csv', index=True)
