@@ -554,33 +554,53 @@ def add_geospatial_aux(df, paths, names, colnames, epsg):
 # populates a column with the indicies of duplicated
 # information; e.g., duplicate coords or dates
 def find_duplicates(df, subset, col_name):
-    
     """
-    Main function that adds columns to a dataframe indicating
-    if a subset of columns are duplicated. E.g., if the same
-    latitude and longitude are found in multiple rows, the
-    indices of those duplicate rows will be recorded as a list
-    in a column.
-    
-    df    (dataframe): dataframe to check for duplicates and add
-                       columns to
-    subset     (list): list of column names that will be checked
-                       for duplicate values
-    col_name (string): column to create that stores a list of
-                       indices where values are duplicated
+    For each row, find other rows that have the same values in `subset`.
+    Adds a new column that contains the list of matching indices (including itself).
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+    subset : list of str
+        Column names to check for matching values.
+    col_name : str
+        Name of the new column to create, which will contain lists of indices.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A copy of df with `col_name` added.
     """
-    
+
     df = df.copy()
-    if df.duplicated(subset=subset).any():
-        print('duplicates found')
-        dupes = df.duplicated(subset=subset, keep=False)
-        dupe_groups = df[dupes].groupby(subset).apply(
-            lambda x: list(x.index)).reset_index(name='indices')
-        idx_to_dupes = {idx: indices for indices in dupe_groups['indices'] for idx in indices}
-        df[col_name] = df.index.map(idx_to_dupes)
-    else:
-        print('no duplicates found')
+
+    # Create a group id based on the subset columns
+    group_ids = df.groupby(subset, sort=False).grouper.group_info[0]
+
+    # Map from group id to list of indices in that group
+    from collections import defaultdict
+    group_to_indices = defaultdict(list)
+    for idx, group_id in zip(df.index, group_ids):
+        if group_id != -1:
+            group_to_indices[group_id].append(idx)
+
+    # Now, for each row, assign the corresponding list of indices
+    duplicated_list = []
+    for idx, group_id in zip(df.index, group_ids):
+        if group_id == -1:
+            duplicated_list.append([])
+        else:
+            indices = group_to_indices[group_id]
+            if len(indices) > 1:
+                duplicated_list.append(indices)
+            else:
+                duplicated_list.append([])
+
+    # Assign to the new column
+    df[col_name] = duplicated_list
+
     return df
+
 
     
 ##########################################################################################
