@@ -131,28 +131,33 @@ def export_dataframe(df: pd.DataFrame, path: str, schema_key: str, index: bool =
     df.to_csv(path, index=index, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
 
 
-def assign_uid_column(df: pd.DataFrame, id_col: str = 'plotVisit', uid_col: str = 'UID', uid_length: int = 10) -> pd.DataFrame:
+def assign_uid_column(
+    df: pd.DataFrame,
+    id_col: str = 'plotVisit',
+    uid_col: str = 'UID',
+    uid_length: int = 10,
+    prefix: str = 'u'   # <-- single‐letter prefix
+) -> pd.DataFrame:
     """
-    Generate a stable hash-based UID from a column and return df with UID.
+    Generate a stable hash‐based UID from a column, prepending a letter so
+    Excel/pandas never misinterpret it as a number.
 
-    Parameters:
-        df (pd.DataFrame): Input DataFrame with a unique ID column (e.g., plotVisit)
-        id_col (str): Column to base the hash on
-        uid_col (str): Name of the new UID column
-        uid_length (int): Number of characters in the hash (default is 10)
-
-    Returns:
-        pd.DataFrame: A copy of df with an added UID column
+    uid_length includes the prefix, so by default you get 1 letter + 9 hex chars.
     """
-    def hash_val(row):
-        val = row[id_col]
-        if pd.isna(val):
-            return 'missing'  # or raise an error, or use a fallback string
-        return hashlib.sha1(str(val).encode()).hexdigest()[:uid_length]
+    # make sure prefix is a single ascii‐letter
+    assert len(prefix) == 1 and prefix.isalpha(), "prefix must be one letter"
 
-    df = df.copy()
-    df[uid_col] = df.apply(hash_val, axis=1)
-    return df
+    core_len = uid_length - 1
+    def hash_val(val):
+        # treat NaN or infinite as “missing”
+        if pd.isna(val) or (isinstance(val, (float, np.floating)) and not np.isfinite(val)):
+            return f"{prefix}missing"
+        raw = hashlib.sha1(str(val).encode()).hexdigest()[:core_len]
+        return f"{prefix}{raw}"
+
+    out = df.copy()
+    out[uid_col] = out[id_col].map(hash_val)
+    return out
 
 
 def replace_column_with_uid(
