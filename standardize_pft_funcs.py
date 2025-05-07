@@ -13,6 +13,10 @@ import tarfile
 from urllib.request import urlretrieve
 import regex as re
 from shapely.validation import make_valid
+import hashlib
+from schemas import SCHEMAS
+from typing import get_args, get_origin, Union, List
+import csv
 
 """
 CAVEATS:
@@ -30,6 +34,177 @@ functions will remain usable!
 ##########################################################################################
 # Main functions that are used in the notebooks. Roughly in order of usage.
 ##########################################################################################
+
+def format_column_dtypes(df: pd.DataFrame, schema_key: str) -> pd.DataFrame:
+    """
+    Coerce DataFrame columns to the expected dtypes based on the Pydantic schema.
+
+    Parameters:
+        df (pd.DataFrame): DataFrame to format
+        schema_key (str): Key from SCHEMAS registry
+
+    Returns:
+        pd.DataFrame: DataFrame with coerced column types
+    """
+    schema = SCHEMAS.get(schema_key)
+    if not schema:
+        raise ValueError(f"No schema found for key: {schema_key}")
+
+    df = df.copy()
+    for name, field in schema.model_fields.items():
+        expected_type = field.annotation
+
+        # Handle Optional[...] types
+        if get_origin(expected_type) is Union:
+            subtypes = [t for t in get_args(expected_type) if t is not type(None)]
+            if len(subtypes) == 1:
+                expected_type = subtypes[0]  # Use the actual inner type
+
+        # Only format if the column exists
+        if name not in df.columns:
+            continue
+
+        try:
+            if expected_type == float:
+                df[name] = pd.to_numeric(df[name], errors="coerce")
+            elif expected_type == int:
+                df[name] = pd.to_numeric(df[name], errors="coerce").astype("Int64")
+            elif expected_type == str:
+                df[name] = df[name].astype(str)
+            elif expected_type == list or get_origin(expected_type) == list:
+                df[name] = df[name].apply(lambda x: x if isinstance(x, list) else ([] if pd.isna(x) else [x]))
+        except Exception as e:
+            print(f"Warning: Could not coerce column '{name}' to {expected_type}: {e}")
+
+    return df
+
+
+def export_dataframe(df: pd.DataFrame, path: str, schema_key: str, index: bool = False, uid_col: str = "plotVisit"):
+    """
+    Validate and export a DataFrame safely using a registered Pydantic schema.
+
+    Parameters:
+        df (pd.DataFrame): DataFrame to validate and export
+        path (str): Output CSV path
+        schema_key (str): Key from SCHEMAS registry to select Pydantic schema
+        index (bool): Whether to include index in export
+        uid_col (str): Column name used as unique ID (default 'plotVisit')
+    """
+
+    schema = SCHEMAS.get(schema_key)
+    if not schema:
+        raise ValueError(f"No schema found for key: {schema_key}")
+
+    df = df.copy()
+
+    # Handle UID column in index
+    if uid_col in df.index.names:
+        df = df.reset_index()
+        was_index = True
+    else:
+        was_index = False
+
+    # Validate each row
+    for i, row in df.iterrows():
+        try:
+            schema(**row.to_dict())
+        except Exception as e:
+            raise ValueError(f"Row {i} failed validation: {e} {row}")
+
+    # Check UID uniqueness (except for species_fcover)
+    if uid_col in df.columns and schema_key != "species_fcover":
+        if df[uid_col].duplicated().any():
+            duplicates = df[df[uid_col].duplicated(keep=False)]
+            raise ValueError(
+                f"Duplicate values found in UID column: {uid_col}. "
+                f"Here are the duplicates:\n{duplicates[[uid_col]]}"
+            )
+
+    # Ensure all object-like columns are cast to string
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].astype(str)
+
+    # Restore index if originally set and requested
+    if was_index and index:
+        df = df.set_index(uid_col)
+
+    df.to_csv(path, index=index, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+
+
+def assign_uid_column(df: pd.DataFrame, id_col: str = 'plotVisit', uid_col: str = 'UID', uid_length: int = 10) -> pd.DataFrame:
+    """
+    Generate a stable hash-based UID from a column and return df with UID.
+
+    Parameters:
+        df (pd.DataFrame): Input DataFrame with a unique ID column (e.g., plotVisit)
+        id_col (str): Column to base the hash on
+        uid_col (str): Name of the new UID column
+        uid_length (int): Number of characters in the hash (default is 10)
+
+    Returns:
+        pd.DataFrame: A copy of df with an added UID column
+    """
+    def hash_val(row):
+        val = row[id_col]
+        if pd.isna(val):
+            return 'missing'  # or raise an error, or use a fallback string
+        return hashlib.sha1(str(val).encode()).hexdigest()[:uid_length]
+
+    df = df.copy()
+    df[uid_col] = df.apply(hash_val, axis=1)
+    return df
+
+
+def replace_column_with_uid(
+    df: pd.DataFrame,
+    uid_map: pd.DataFrame,
+    id_col: str = 'plotVisit',
+    uid_col: str = 'UID',
+    set_index: bool = False,
+    schema_key: str = None
+) -> pd.DataFrame:
+    """
+    Replaces a specified ID column in a DataFrame with a hashed UID from a mapping,
+    ensuring the result is stored as a string. Allows non-unique ID values for
+    certain schemas (e.g., species_fcover).
+
+    Parameters:
+        df (pd.DataFrame): DataFrame containing the ID column to replace.
+        uid_map (pd.DataFrame): Mapping DataFrame with columns [id_col, uid_col].
+        id_col (str): Name of the ID column to replace in df.
+        uid_col (str): Name of the UID column in uid_map.
+        set_index (bool): If True, set the hashed UID as index.
+        schema_key (str): Optional schema key to allow UID exceptions (e.g., 'species_fcover').
+
+    Returns:
+        pd.DataFrame: Updated DataFrame with replaced and optionally reordered ID column.
+    """
+
+    # Check uniqueness unless allowed by schema
+    if schema_key != "species_fcover":
+        if not df[id_col].is_unique:
+            raise Exception(f"There are non-unique values in {id_col}")
+        if not uid_map[uid_col].is_unique:
+            raise Exception(f"There are non-unique values in {uid_col}")
+
+    # Ensure id_col is string type in both dataframes
+    df[id_col] = df[id_col].astype(str)
+    uid_map[id_col] = uid_map[id_col].astype(str)
+
+    # Merge and replace old column
+    df = df.merge(uid_map[[id_col, uid_col]], on=id_col, how='left')
+    df = df.drop(columns=id_col).rename(columns={uid_col: id_col})
+
+    # Reorder columns to keep ID column first
+    cols = [id_col] + [c for c in df.columns if c != id_col]
+    df = df[cols]
+
+    # Optionally set index
+    if set_index:
+        df = df.set_index(id_col)
+
+    return df
+
 
 def get_unique_species(DFRAME, SCOL, DNAME, SAVE=False, OUTP=False):
     
@@ -509,69 +684,113 @@ def add_standard_cols(df, pft_cols):
     df[addcols] = np.nan
     return df
 
-def add_geospatial_aux(df, paths, names, colnames, epsg):
-    
+
+def add_geospatial_aux(
+    points_gdf: gpd.GeoDataFrame,
+    paths: List[str],
+    orig_names: List[List[str]],
+) -> gpd.GeoDataFrame:
     """
-    Main function that, given a list of paths, reads a shapefile
-    into a geodataframe. Then, it fixes any invalid geometry and
-    finds the intersection between a provided dataframe of points 
-    and the shapefile geodataframes. Geodataframes must be in the
-    same projection (EPSG:4326 yields incorrect results; choose a
-    projected EPSG).
-    
-    df  (dataframe): geodataframe of points to add intersections to
-    paths    (list): list of paths to shapefiles of polygons
-    names    (list): list of names for the shapefiles of polygons
-    colnames (list): list of lists containing the column names to
-                     keep during intersection
-    epsg   (string): EPSG code indicating a shared projection 
-                     between the df and shapefiles
+    Adds attributes from multiple polygon shapefiles to a point GeoDataFrame
+    via spatial join. Maintains original index length and adds shapefile-derived
+    columns with unique suffixes to avoid name collisions.
+
+    Parameters:
+    df          (GeoDataFrame): Point GeoDataFrame.
+    idx_col              (str): Name to give the index column
+    paths          (List[str]): Paths to shapefiles.
+    orig_names (List[List[str]]): Column names to retain per shapefile (must include 'geometry').
+    epsg                 (str): EPSG code for projection (must be projected, not WGS84).
+
+    Returns:
+    GeoDataFrame with additional attributes from shapefile intersections.
     """
-    
-    new_df = df.copy()
-    
-    def fix_geometries(gdf):
-        valid_geoms = gdf[gdf['geometry'].notna()].copy()
-        none_geoms = gdf[gdf['geometry'].isna()].copy()
-        valid_geoms['geometry'] = valid_geoms['geometry'].apply(make_valid)
-        return valid_geoms
-    
-    def read_geospatial(path):
-        gdf = gpd.read_file(path)
-        gdf = gdf.to_crs(epsg)
-        gdf = fix_geometries(gdf)
+
+    points_gdf = points_gdf.copy()
+    aux_dataframes = []
+
+    def fix_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        gdf = gdf[gdf.geometry.notna()].copy()
+        gdf['geometry'] = gdf['geometry'].apply(make_valid)
         return gdf
-    
-    for path, name, cnames in zip(paths, names, colnames):
-        
-        gdf = read_geospatial(path)
+
+    def read_and_prepare(path: str, columns: List[str]) -> gpd.GeoDataFrame:
+        gdf = gpd.read_file(path)
         gdf = fix_geometries(gdf)
-        new_df = gpd.sjoin(new_df, gdf[cnames], 
-                           how='left', predicate='intersects', rsuffix=name)
-        
-    return new_df
+        return gdf[columns], gdf.crs
+
+    for path, orig_cols in zip(paths, orig_names):
+        poly_gdf, poly_crs = read_and_prepare(path, orig_cols)
+        print(f"Finding spatial intersection for '{orig_cols}' in native CRS: {poly_crs}")
+
+        # We only need the index and points data from the points_gdf
+        projected_points = points_gdf[['geometry']].to_crs(poly_crs)
+
+        # Perform join between projected_points (geometry) and poly_gdf[orig_names]
+        joined = gpd.sjoin(projected_points, poly_gdf, how='left', predicate='intersects')
+
+        # Group by index and aggregate (set, otherwise default first)
+        agg_dict = {col: set for col in orig_cols}
+
+        # Ensure cell values are strings or list of strings
+        def normalize_cell(val):
+            if not isinstance(val, set):
+                return val  # leave untouched
+            val = {v for v in val if pd.notna(v)}  # drop nan from set
+            if not val:
+                return None
+            val = [str(v) for v in val]
+            return val[0] if len(val) == 1 else val
+
+        grouped = joined.groupby(level=0).agg(agg_dict)
+        grouped = grouped.applymap(normalize_cell)
+        aux_dataframes.append(grouped)
+
+    new_cols = pd.concat(aux_dataframes, axis=1)
+    merged = points_gdf.merge(new_cols, how='left', left_index=True, right_index=True)
+    merged = merged.drop(columns=[col for col in merged.columns if 'geometry' in col])
+
+    def clean_set_cell(val):
+        if isinstance(val, set):
+            if len(val) == 0:
+                return None
+            # Drop null-like items
+            non_null = {v for v in val if not pd.isna(v)}
+            if len(non_null) == 0:
+                return None
+            elif len(non_null) == 1:
+                return next(iter(non_null))  # unwrap the single item
+            else:
+                return list(non_null)        # convert to list
+        return val  # leave non-sets untouched
+
+    merged = merged.applymap(clean_set_cell)
+    return merged
+
 
 # populates a column with the indicies of duplicated
 # information; e.g., duplicate coords or dates
 def find_duplicates(df, subset, col_name):
     """
     For each row, find other rows that have the same values in `subset`.
-    Adds a new column that contains the list of matching indices (including itself).
+    Adds a new column that contains the list of matching indices (including itself),
+    with indices converted to strings for schema compatibility.
 
     Parameters
     ----------
     df : pandas.DataFrame
+        DataFrame to check for duplicates and add the result column to.
     subset : list of str
         Column names to check for matching values.
     col_name : str
-        Name of the new column to create, which will contain lists of indices.
+        Name of the new column to create, which will contain lists of matching indices.
 
     Returns
     -------
     pandas.DataFrame
-        A copy of df with `col_name` added.
+        A copy of df with `col_name` added. Each row contains a list of matching index values
+        (as strings), or an empty list if no duplicates were found.
     """
-
     df = df.copy()
 
     # Create a group id based on the subset columns
@@ -592,7 +811,7 @@ def find_duplicates(df, subset, col_name):
         else:
             indices = group_to_indices[group_id]
             if len(indices) > 1:
-                duplicated_list.append(indices)
+                duplicated_list.append([str(i) for i in indices])  # Convert to strings here
             else:
                 duplicated_list.append([])
 
