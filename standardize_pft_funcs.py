@@ -13,6 +13,10 @@ import tarfile
 from urllib.request import urlretrieve
 import regex as re
 from shapely.validation import make_valid
+import hashlib
+from schemas import SCHEMAS
+from typing import get_args, get_origin, Union, List
+import csv
 
 """
 CAVEATS:
@@ -30,6 +34,182 @@ functions will remain usable!
 ##########################################################################################
 # Main functions that are used in the notebooks. Roughly in order of usage.
 ##########################################################################################
+
+def format_column_dtypes(df: pd.DataFrame, schema_key: str) -> pd.DataFrame:
+    """
+    Coerce DataFrame columns to the expected dtypes based on the Pydantic schema.
+
+    Parameters:
+        df (pd.DataFrame): DataFrame to format
+        schema_key (str): Key from SCHEMAS registry
+
+    Returns:
+        pd.DataFrame: DataFrame with coerced column types
+    """
+    schema = SCHEMAS.get(schema_key)
+    if not schema:
+        raise ValueError(f"No schema found for key: {schema_key}")
+
+    df = df.copy()
+    for name, field in schema.model_fields.items():
+        expected_type = field.annotation
+
+        # Handle Optional[...] types
+        if get_origin(expected_type) is Union:
+            subtypes = [t for t in get_args(expected_type) if t is not type(None)]
+            if len(subtypes) == 1:
+                expected_type = subtypes[0]  # Use the actual inner type
+
+        # Only format if the column exists
+        if name not in df.columns:
+            continue
+
+        try:
+            if expected_type == float:
+                df[name] = pd.to_numeric(df[name], errors="coerce")
+            elif expected_type == int:
+                df[name] = pd.to_numeric(df[name], errors="coerce").astype("Int64")
+            elif expected_type == str:
+                df[name] = df[name].astype(str)
+            elif expected_type == list or get_origin(expected_type) == list:
+                df[name] = df[name].apply(lambda x: x if isinstance(x, list) else ([] if pd.isna(x) else [x]))
+        except Exception as e:
+            print(f"Warning: Could not coerce column '{name}' to {expected_type}: {e}")
+
+    return df
+
+
+def export_dataframe(df: pd.DataFrame, path: str, schema_key: str, index: bool = False, uid_col: str = "plotVisit"):
+    """
+    Validate and export a DataFrame safely using a registered Pydantic schema.
+
+    Parameters:
+        df (pd.DataFrame): DataFrame to validate and export
+        path (str): Output CSV path
+        schema_key (str): Key from SCHEMAS registry to select Pydantic schema
+        index (bool): Whether to include index in export
+        uid_col (str): Column name used as unique ID (default 'plotVisit')
+    """
+
+    schema = SCHEMAS.get(schema_key)
+    if not schema:
+        raise ValueError(f"No schema found for key: {schema_key}")
+
+    df = df.copy()
+
+    # Handle UID column in index
+    if uid_col in df.index.names:
+        df = df.reset_index()
+        was_index = True
+    else:
+        was_index = False
+
+    # Validate each row
+    for i, row in df.iterrows():
+        try:
+            schema(**row.to_dict())
+        except Exception as e:
+            raise ValueError(f"Row {i} failed validation: {e} {row}")
+
+    # Check UID uniqueness (except for species_fcover)
+    if uid_col in df.columns and schema_key != "species_fcover":
+        if df[uid_col].duplicated().any():
+            duplicates = df[df[uid_col].duplicated(keep=False)]
+            raise ValueError(
+                f"Duplicate values found in UID column: {uid_col}. "
+                f"Here are the duplicates:\n{duplicates[[uid_col]]}"
+            )
+
+    # Ensure all object-like columns are cast to string
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].astype(str)
+
+    # Restore index if originally set and requested
+    if was_index and index:
+        df = df.set_index(uid_col)
+
+    df.to_csv(path, index=index, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+
+
+def assign_uid_column(
+    df: pd.DataFrame,
+    id_col: str = 'plotVisit',
+    uid_col: str = 'UID',
+    uid_length: int = 10,
+    prefix: str = 'u'   # <-- single‐letter prefix
+) -> pd.DataFrame:
+    """
+    Generate a stable hash‐based UID from a column, prepending a letter so
+    Excel/pandas never misinterpret it as a number.
+
+    uid_length includes the prefix, so by default you get 1 letter + 9 hex chars.
+    """
+    # make sure prefix is a single ascii‐letter
+    assert len(prefix) == 1 and prefix.isalpha(), "prefix must be one letter"
+
+    core_len = uid_length - 1
+    def hash_val(val):
+        # treat NaN or infinite as “missing”
+        if pd.isna(val) or (isinstance(val, (float, np.floating)) and not np.isfinite(val)):
+            return f"{prefix}missing"
+        raw = hashlib.sha1(str(val).encode()).hexdigest()[:core_len]
+        return f"{prefix}{raw}"
+
+    out = df.copy()
+    out[uid_col] = out[id_col].map(hash_val)
+    return out
+
+
+def replace_column_with_uid(
+    df: pd.DataFrame,
+    uid_map: pd.DataFrame,
+    id_col: str = 'plotVisit',
+    uid_col: str = 'UID',
+    set_index: bool = False,
+    schema_key: str = None
+) -> pd.DataFrame:
+    """
+    Replaces a specified ID column in a DataFrame with a hashed UID from a mapping,
+    ensuring the result is stored as a string. Allows non-unique ID values for
+    certain schemas (e.g., species_fcover).
+
+    Parameters:
+        df (pd.DataFrame): DataFrame containing the ID column to replace.
+        uid_map (pd.DataFrame): Mapping DataFrame with columns [id_col, uid_col].
+        id_col (str): Name of the ID column to replace in df.
+        uid_col (str): Name of the UID column in uid_map.
+        set_index (bool): If True, set the hashed UID as index.
+        schema_key (str): Optional schema key to allow UID exceptions (e.g., 'species_fcover').
+
+    Returns:
+        pd.DataFrame: Updated DataFrame with replaced and optionally reordered ID column.
+    """
+
+    # Check uniqueness unless allowed by schema
+    if schema_key != "species_fcover":
+        if not df[id_col].is_unique:
+            raise Exception(f"There are non-unique values in {id_col}")
+        if not uid_map[uid_col].is_unique:
+            raise Exception(f"There are non-unique values in {uid_col}")
+
+    # Ensure id_col is string type in both dataframes
+    df[id_col] = df[id_col].astype(str)
+    uid_map[id_col] = uid_map[id_col].astype(str)
+
+    # Merge and replace old column
+    df = df.merge(uid_map[[id_col, uid_col]], on=id_col, how='left')
+    df = df.drop(columns=id_col).rename(columns={uid_col: id_col})
+
+    # Reorder columns to keep ID column first
+    cols = [id_col] + [c for c in df.columns if c != id_col]
+    df = df[cols]
+
+    # Optionally set index
+    if set_index:
+        df = df.set_index(id_col)
+
+    return df
+
 
 def get_unique_species(DFRAME, SCOL, DNAME, SAVE=False, OUTP=False):
     
@@ -343,59 +523,78 @@ def add_standard_cols(df):
     df[addcols] = np.nan
     return df
 
+def neon_plot_centroids(dfs, file_paths, DIR):
+    """
+    Main function for NEON data that extracts the centroid coordinates 
+    for the 1-meter-level plots. This data has to be queried online. 
+    The coordinates provided in the .csv are for the larger 40-meter plot.
 
-def neon_plot_centroids(dfs, DIR):
-    
-    """
-    Main function for NEON data that is used to extract
-    the centroid coordinates for the 1-meter-level plots;
-    this data has to be queried online. The coordinates
-    provided in the .csv are for the larger 40-meter plot.
-    This function is not generalizable at all, apologies.
-    
-    dfs   (list): list containing pandas dataframes with neon
-                  fcover data (pandas dataframes created from
-                  the TOOL.csv and BARR.csv
-    DIR (string): path to the output .csv that combines TOOL
-                  and BARR .csvs
+    dfs        (list): List containing pandas DataFrames with NEON fCover data.
+    file_paths (list): List of file paths corresponding to the DataFrames.
+    DIR       (string): Path to the output directory where the combined .csv will be saved.
     """
     
-    # create name column to exract plot centroids
+    # Combine all dataframes into one
     df = pd.concat(dfs)
     df.reset_index(inplace=True, drop=True)
     df['name'] = df.namedLocation + '.' + df.subplotID
-    
-    # get subplot lat/lon from server
+
+    # Extract source names (e.g., TOOL, BARR) and years from file paths
+    source_names = set()
+    years = set()
+
+    for filepath in file_paths:
+        filename = os.path.basename(filepath)
+        filename_parts = filename.split('.')
+        
+        # 'NEON', 'D18', 'BARR', 'DP1', '10058', '001', 'div_1m2Data', '2016-07', 'basic', '20241118T015606Z', 'csv'
+        # Extract the site name (SITE)
+        source_name = filename_parts[2]
+        source_names.add(source_name)
+
+        # Extract the year (YYYY-MM)
+        year = filename_parts[7].split('-')[0]
+        years.add(year)
+
+    # Construct output filename
+    source_str = "_".join(sorted(source_names)) if source_names else "NOSOURCE"
+    year_range = f"{min(years)}-{max(years)}" if years else "NOYEAR"
+    output_file = f"neon_cover_{source_str}_1m2Data_{year_range}.csv"
+
+    # Get subplot lat/lon from server
     requests_dict = {}
     plots = df['name'].to_list()
     url = 'http://data.neonscience.org/api/v0/locations/'
     locs = []
 
     for plot in plots:
-
-        # only get response when the request is new
         response = None
-        if plot not in list(requests_dict.keys()):
-            response = requests.get(url + plot)
-            requests_dict[plot] = response
+        if plot not in requests_dict:
+            print(url + plot)
+            try:
+                response = requests.get(url + plot)
+                requests_dict[plot] = response
+            except Exception as e:
+                print('Exception occurred: ', e)
         else:
             response = requests_dict[plot]
-        # print(url + plot, end='\r')
 
-        # extract lat/lon
+        # Extract lat/lon
         try:
             lat = response.json()['data']['locationDecimalLatitude']
             lon = response.json()['data']['locationDecimalLongitude']
         except Exception as e:
-            # print(response.content)
-            print(e)
+            print('Exception occurred: ', e)
             lat, lon = None, None
-        locs.append([lat,lon])
+        locs.append([lat, lon])
         
-    # add coordinate data to rows
+    # Add coordinate data to rows
     coords = pd.DataFrame(locs, columns=['subplot_lat','subplot_lon'])
     new_df = pd.concat([df, coords], axis=1)
-    new_df.to_csv(DIR + '/NEON.D18.TOOLBARR.DP1.10058.001.div_1m2Data.2021.csv')
+
+    # Save output file
+    new_df.to_csv(os.path.join(DIR, output_file), index=False)
+    print(f"Saved file: {output_file}")
     
 
 def leaf_retention_df(path):
@@ -490,99 +689,167 @@ def add_standard_cols(df, pft_cols):
     df[addcols] = np.nan
     return df
 
-def add_geospatial_aux(df, paths, names, colnames, epsg):
-    
+
+def add_geospatial_aux(
+    points_gdf: gpd.GeoDataFrame,
+    paths: List[str],
+    orig_names: List[List[str]],
+) -> gpd.GeoDataFrame:
     """
-    Main function that, given a list of paths, reads a shapefile
-    into a geodataframe. Then, it fixes any invalid geometry and
-    finds the intersection between a provided dataframe of points 
-    and the shapefile geodataframes. Geodataframes must be in the
-    same projection (EPSG:4326 yields incorrect results; choose a
-    projected EPSG).
-    
-    df  (dataframe): geodataframe of points to add intersections to
-    paths    (list): list of paths to shapefiles of polygons
-    names    (list): list of names for the shapefiles of polygons
-    colnames (list): list of lists containing the column names to
-                     keep during intersection
-    epsg   (string): EPSG code indicating a shared projection 
-                     between the df and shapefiles
+    Adds attributes from multiple polygon shapefiles to a point GeoDataFrame
+    via spatial join. Maintains original index length and adds shapefile-derived
+    columns with unique suffixes to avoid name collisions.
+
+    Parameters:
+    df          (GeoDataFrame): Point GeoDataFrame.
+    idx_col              (str): Name to give the index column
+    paths          (List[str]): Paths to shapefiles.
+    orig_names (List[List[str]]): Column names to retain per shapefile (must include 'geometry').
+    epsg                 (str): EPSG code for projection (must be projected, not WGS84).
+
+    Returns:
+    GeoDataFrame with additional attributes from shapefile intersections.
     """
-    
-    new_df = df.copy()
-    
-    def fix_geometries(gdf):
-        valid_geoms = gdf[gdf['geometry'].notna()].copy()
-        none_geoms = gdf[gdf['geometry'].isna()].copy()
-        valid_geoms['geometry'] = valid_geoms['geometry'].apply(make_valid)
-        return valid_geoms
-    
-    def read_geospatial(path):
-        gdf = gpd.read_file(path)
-        gdf = gdf.to_crs(epsg)
-        gdf = fix_geometries(gdf)
+
+    points_gdf = points_gdf.copy()
+    aux_dataframes = []
+
+    def fix_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        gdf = gdf[gdf.geometry.notna()].copy()
+        gdf['geometry'] = gdf['geometry'].apply(make_valid)
         return gdf
-    
-    for path, name, cnames in zip(paths, names, colnames):
-        
-        gdf = read_geospatial(path)
+
+    def read_and_prepare(path: str, columns: List[str]) -> gpd.GeoDataFrame:
+        gdf = gpd.read_file(path)
         gdf = fix_geometries(gdf)
-        new_df = gpd.sjoin(new_df, gdf[cnames], 
-                           how='left', predicate='intersects', rsuffix=name)
-        
-    return new_df
+        return gdf[columns], gdf.crs
+
+    for path, orig_cols in zip(paths, orig_names):
+        poly_gdf, poly_crs = read_and_prepare(path, orig_cols)
+        print(f"Finding spatial intersection for '{orig_cols}' in native CRS: {poly_crs}")
+
+        # We only need the index and points data from the points_gdf
+        projected_points = points_gdf[['geometry']].to_crs(poly_crs)
+
+        # Perform join between projected_points (geometry) and poly_gdf[orig_names]
+        joined = gpd.sjoin(projected_points, poly_gdf, how='left', predicate='intersects')
+
+        # Group by index and aggregate (set, otherwise default first)
+        agg_dict = {col: set for col in orig_cols}
+
+        # Ensure cell values are strings or list of strings
+        def normalize_cell(val):
+            if not isinstance(val, set):
+                return val  # leave untouched
+            val = {v for v in val if pd.notna(v)}  # drop nan from set
+            if not val:
+                return None
+            val = [str(v) for v in val]
+            return val[0] if len(val) == 1 else val
+
+        grouped = joined.groupby(level=0).agg(agg_dict)
+        grouped = grouped.applymap(normalize_cell)
+        aux_dataframes.append(grouped)
+
+    new_cols = pd.concat(aux_dataframes, axis=1)
+    merged = points_gdf.merge(new_cols, how='left', left_index=True, right_index=True)
+    merged = merged.drop(columns=[col for col in merged.columns if 'geometry' in col])
+
+    def clean_set_cell(val):
+        if isinstance(val, set):
+            if len(val) == 0:
+                return None
+            # Drop null-like items
+            non_null = {v for v in val if not pd.isna(v)}
+            if len(non_null) == 0:
+                return None
+            elif len(non_null) == 1:
+                return next(iter(non_null))  # unwrap the single item
+            else:
+                return list(non_null)        # convert to list
+        return val  # leave non-sets untouched
+
+    merged = merged.applymap(clean_set_cell)
+    return merged
+
 
 # populates a column with the indicies of duplicated
 # information; e.g., duplicate coords or dates
 def find_duplicates(df, subset, col_name):
-    
     """
-    Main function that adds columns to a dataframe indicating
-    if a subset of columns are duplicated. E.g., if the same
-    latitude and longitude are found in multiple rows, the
-    indices of those duplicate rows will be recorded as a list
-    in a column.
-    
-    df    (dataframe): dataframe to check for duplicates and add
-                       columns to
-    subset     (list): list of column names that will be checked
-                       for duplicate values
-    col_name (string): column to create that stores a list of
-                       indices where values are duplicated
+    For each row, find other rows that have the same values in `subset`.
+    Adds a new column that contains the list of matching indices (including itself),
+    with indices converted to strings for schema compatibility.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame to check for duplicates and add the result column to.
+    subset : list of str
+        Column names to check for matching values.
+    col_name : str
+        Name of the new column to create, which will contain lists of matching indices.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A copy of df with `col_name` added. Each row contains a list of matching index values
+        (as strings), or an empty list if no duplicates were found.
     """
-    
     df = df.copy()
-    if df.duplicated(subset=subset).any():
-        print('duplicates found')
-        dupes = df.duplicated(subset=subset, keep=False)
-        dupe_groups = df[dupes].groupby(subset).apply(
-            lambda x: list(x.index)).reset_index(name='indices')
-        idx_to_dupes = {idx: indices for indices in dupe_groups['indices'] for idx in indices}
-        df[col_name] = df.index.map(idx_to_dupes)
-    else:
-        print('no duplicates found')
+
+    # Create a group id based on the subset columns
+    group_ids = df.groupby(subset, sort=False).grouper.group_info[0]
+
+    # Map from group id to list of indices in that group
+    from collections import defaultdict
+    group_to_indices = defaultdict(list)
+    for idx, group_id in zip(df.index, group_ids):
+        if group_id != -1:
+            group_to_indices[group_id].append(idx)
+
+    # Now, for each row, assign the corresponding list of indices
+    duplicated_list = []
+    for idx, group_id in zip(df.index, group_ids):
+        if group_id == -1:
+            duplicated_list.append([])
+        else:
+            indices = group_to_indices[group_id]
+            if len(indices) > 1:
+                duplicated_list.append([str(i) for i in indices])  # Convert to strings here
+            else:
+                duplicated_list.append([])
+
+    # Assign to the new column
+    df[col_name] = duplicated_list
+
     return df
+
 
     
 ##########################################################################################
 # Pandas row-wise functions to use with .apply()
 ##########################################################################################
 
-# function to get genus and species name
 def get_substrings(row):
+
+    # NOTE: DO NOT modify this code to change the source words in any way
+    # because then you won't be able to match new names to originals later
     
-    # extract genus + species name
-    words = row.split()[:2]
-    if 'species' in words: # if just genus
-        string = words[0]
-    elif 'Unknown' in words: # if unknown species
-        string = words[1]
+    if not isinstance(row, str) or not row.strip():  # Handle empty or non-string inputs
+        return None
+    
+    words = row.split()[:2] # assumed output: [genus, species]
+    lowercase_words = [word.lower() for word in words]
+    
+    if len(words) == 0:  # edge case: empty list
+        return None
+    elif len(words) == 1 or 'species' in lowercase_words:  # Edge case: only one word present
+        return words[0]
+    elif lowercase_words[0] == 'unknown' and len(words) >1:  # Handling 'Unknown' case
+        return words[1]
     else:
-        string = ' '.join(words)
-        
-    # remove potential brackets in string
-    string = string.replace('[','').replace(']','')
-    return string
+        return ' '.join(words[:2]) # return the words
 
 
 # function get genus name only
