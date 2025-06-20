@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # mpiexec -n 4 python3 northslope_pft_mapping.py
+# 4 is the number of PFTs I'm processing (see line 33)
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from mpi4py import MPI
 import logging
 from osgeo import gdal
 from datetime import datetime
+import sys
 
 now = datetime.now()
 dt_string = now.strftime("%d-%m-%Y-%H%M%S")
@@ -23,23 +25,75 @@ dt_string = now.strftime("%d-%m-%Y-%H%M%S")
 # General Params
 OVERWRITE = True
 BASE = '/mnt/poseidon/remotesensing/arctic/data'
-OUT_DIR = f'{BASE}/rasters/model_results_tiled_test07'
+OUT_DIR = f'{BASE}/rasters/model_results_tiled_test_06-19-2025'
 DATA_DIR = f'{BASE}/rasters'
 CELL_LIST = list(range(1077,4595))
 REF_RAST = f'{DATA_DIR}/s2_sr_tiled/ak_arctic_summer/B11/2019-06-01_to_2019-08-31'
-MODEL = f'{BASE}/training/Test_06/results/ModelTuning_FeatureImportance'
-PFTS = ['evergreen shrub', 'forb', 'graminoid', 'litter']
+MODEL = f'{BASE}/training/Test_06/results/03'
+# PFTS = ['evergreen shrub', 'forb', 'graminoid', 'litter']
+# PFTS = ['deciduous shrub', 'lichen', 'bryophyte', 'non-vascular']
+PFTS = ['litter']
+
+# specify pkl file names and map to associated PFT
+pft_file_map = {
+    "bryophyte": {
+        "model":         "bryophyte_30m_parent_sources5_IQR3.pkl",
+        "outfile_suffix": "30M-5P-IQR3",
+    },
+    "lichen": {
+        "model":         "lichen_55m_parent_sources3_IQR2.5.pkl",
+        "outfile_suffix": "55M-3P-IQR2.5",
+    },
+    "deciduous shrub": {
+        "model":         "deciduous shrub_30m_child_sources3_IQR2.pkl",
+        "outfile_suffix": "30M-3C-IQR2",
+    },
+    "evergreen shrub": {
+        "model":         "evergreen shrub_30m_parent_sources4_IQR2.5.pkl",
+        "outfile_suffix": "30M-4P-IQR2.5",
+    },
+    "forb": {
+        "model":         "forb_55m_child_sources5_IQR1.5.pkl",
+        "outfile_suffix": "55M-5C-IQR1.5",
+    },
+    "graminoid": {
+        "model":         "graminoid_30m_parent_sources3_IQR2.pkl",
+        "outfile_suffix": "30M-3P-IQR2",
+    },
+    "non-vascular": {
+        "model":         "non-vascular_30m_parent_sources2_IQR1.5.pkl",
+        "outfile_suffix": "30M-2P-IQR1.5",
+    },
+    #     "litter": {
+    #     "model":         "litter_55m_child_sources2_IQR1.pkl",
+    #     "outfile_suffix": "55M-2C-IQR1",
+    # },
+        "litter": {
+        "model":         "litter_55m_child_sources4_IQR2.pkl",
+        "outfile_suffix": "55M-4C-IQR2",
+    },
+}
 
 # Sensor-specific Params
 S2_DIR = f'{DATA_DIR}/s2_sr_tiled/ak_arctic_summer/*/*'
 S1_DIR = f'{DATA_DIR}/s1_grd_tiled'
-DEM_DIR = f'{DATA_DIR}/acrtic_dem_tiled'
+DEM_DIR = f'{DATA_DIR}/arctic_dem_tiled'
 print('Number of gridcells to work on:', len(CELL_LIST))
 
 # parallel processing
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
+
+# logging configuration
+os.makedirs(OUT_DIR, exist_ok=True)
+logging.basicConfig(
+    level    = logging.INFO,
+    filename = f'{OUT_DIR}/std_{dt_string}.log',
+    filemode = 'w',
+    format   = '%(asctime)s >>> %(message)s',
+    datefmt  = '%d-%b-%y %H:%M:%S'
+)
 
 #########################################################################
 # Definitions
@@ -154,11 +208,6 @@ for p_idx in range(len(split_processes)):
     else:
         pass
 
-logging.basicConfig(level = logging.INFO,
-                    filename=f'{OUT_DIR}/std_{grid_list[0]}_to_{grid_list[-1]}_{dt_string}.log', filemode='w',
-                    format='%(asctime)s >>> %(message)s', 
-                    datefmt='%d-%b-%y %H:%M:%S')
-
 print(f'CURRENT RANK: {rank}')
 print(f'GRIDCELLS: {grid_list[0]} to {grid_list[-1]}')
 logging.info(f'CURRENT RANK: {rank}')
@@ -167,36 +216,30 @@ logging.info(f'GRIDCELLS: {grid_list[0]} to {grid_list[-1]}')
 #########################################################################
 # Begin modeling
 #########################################################################
-    
-# example model output dataframe for reference creating df to give to model
-demo_df = pd.read_csv(f'{MODEL}/FeatureDemo_non-vascular.csv', index_col=0)
-col_order = demo_df.columns.tolist() # this var is used near line 266
 
 # loop through gridcells
 for gridcell in grid_list:
-    
-    # overwrite or don't overwrite
-    last_pft = f"{OUT_DIR}/GRIDCELL_{gridcell}_non-vascular.tif"
-    
-    if OVERWRITE == False:
-        # don't overwrite, stop here for current gridcell
-        if os.path.isfile(last_pft):
-            print(f'All files exist for a gridcell, skipping {gridcell}...')
-            continue
-        # otherwise, do the next steps
-        else:
-            print(f'Output does not exist, so overwriting existing {gridcell}...')
-            pass       
-    elif OVERWRITE == True:
-        # overwrite existing tifs
-        pass
-    else:
-        logging.critical('Choose OVERWRITE = True or OVERWRITE = False.')
-        quit()
+
+    # 1) Build the exact list of expected outputs—*with* suffix
+    expected = [
+        os.path.join(
+            OUT_DIR,
+            f"GRIDCELL_{gridcell}_{p.replace(' ', '_')}_{pft_file_map[p]['outfile_suffix']}.tif"
+        )
+        for p in PFTS
+    ]
+
+    # 2) If NONE need writing, skip all the heavy raster work
+    if not OVERWRITE and all(os.path.isfile(path) for path in expected):
+        msg = f"SKIPPING GRIDCELL {gridcell}: all {len(PFTS)} files exist"
+        print(msg)
+        logging.info(msg)
+        continue
 
     # set loop vars
     reference = f'{REF_RAST}/GRIDCELL_{gridcell}.tif'
     scale_factor = 0.0001 # for rescaling S2 band values
+
     # reference raster is from S2, hence the scaling for good measure
     reference_raster = rxr.open_rasterio(reference)
     reference_raster = reference_raster.where(reference_raster != 0, -9999)
@@ -290,22 +333,39 @@ for gridcell in grid_list:
     #########################################################################
     
     for PFT in PFTS:
+
+        entry = pft_file_map.get(PFT)
+        if entry is None:
+            logging.error(f"No mapping for PFT '{PFT}', skipping.")
+            continue
         
         try:
 
-            ## Load the pickled model from the file
-            model_file_path = f'{MODEL}/tunedModel_{PFT}.pkl'
-            # sort columns to match what is expected by pkl file
-            df = df[col_order] # col_order is near line 179
-            with open(model_file_path, 'rb') as model_file:
-                model = pickle.load(model_file)
+            # get pickle path
+            model_file_path = os.path.join(MODEL, "tunedModel_" + entry["model"])
+            if not os.path.isfile(model_file_path):
+                logging.critical(f"Model file not found: {model_file_path}. Exiting.")
+                sys.exit(1)
 
-            # --- prediction directly using the model
-            fcover = model.predict(df) # fcover is a 1 by n 
+            # 2) Load the pickled model
+            with open(model_file_path, "rb") as f:
+                model = pickle.load(f)
+
+            # 3) Reorder df and predict
+            col_order = list(model.feature_names_in_)
+            df2 = df[col_order]
+            fcover = model.predict(df2)  # fcover is 1 × n
+
+            # 4) Build output filename with suffix
+            pft_slug = PFT.replace(" ", "_")
+            tag      = entry["outfile_suffix"]
+            out_name = f"GRIDCELL_{gridcell}_{pft_slug}_{tag}.tif"
+            out_path = os.path.join(OUT_DIR, out_name)
             
         except Exception as e:
-            print(f'EXCEPTION WAS RAISED WHILE MODELING {gridcell}: {e}')
-            logging.error(f'EXCEPTION WAS RAISED WHILE MODELING {gridcell}: ', exc_info=True)
+            msg = f"ERROR MODELLING FAILED FOR GRIDCELL {gridcell}, PFT '{PFT}': {e}"
+            print(msg)
+            logging.error(msg, exc_info=True)
             continue
 
         
@@ -320,18 +380,18 @@ for gridcell in grid_list:
         
         # export xarray as tif
         try:
-            PFT = PFT.replace(" ", "_")
             results_xr = xr.Dataset.from_dataframe(results.set_index(['band', 'y', 'x']))
-            xr_band = results_xr.isel(band=0)
-            xr_band = xr_band.rio.write_crs('EPSG:4326')
-            out_path = f"{OUT_DIR}/GRIDCELL_{gridcell}_{PFT}.tif"
+            xr_band = results_xr.isel(band=0).rio.write_crs('EPSG:4326')
             xr_band.rio.to_raster(out_path)
-            print(f"EXPORTED {out_path}")
-            logging.info(f"EXPORTED {out_path}")
+
+            msg = f"EXPORTED {out_path}"
+            print(msg)
+            logging.info(msg)
             
         except Exception as e:
-            print(f'EXCEPTION WAS RAISED WHILE EXPORTING {gridcell}: {e}')
-            logging.error(f'EXCEPTION WAS RAISED WHILE EXPORTING {gridcell}: ', exc_info=True)
+            msg = f"EXCEPTION WHILE EXPORTING FOR GRIDCELL {gridcell}, PFT '{PFT}': {e}"
+            print(msg)
+            logging.error(msg, exc_info=True)
             continue
             
         # set crs
