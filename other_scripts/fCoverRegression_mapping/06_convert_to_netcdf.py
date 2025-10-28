@@ -1,55 +1,95 @@
 import datetime
 import glob
 import os
-import time
 
 import cftime as cf
 import numpy as np
 import xarray as xr
-from osgeo import gdal
 import rioxarray as rxr
+import os, shlex, subprocess
+from osgeo import gdal
 
-# parameters and paths
+# set parameters
 dirpath = "/mnt/poseidon/remotesensing/arctic/data/rasters/model_results_tiled_test_06-19-2025"
-sdate = datetime.datetime(2019, 6, 1, 0, 0, 0)
-edate = datetime.datetime(2019, 9, 30, 23, 59, 59)
+sdate = datetime.datetime(2019, 6, 1)
+edate = datetime.datetime(2019, 9, 30)
 filepaths = sorted(glob.glob(f"{dirpath}/*_mosaic_clipped_masked.tif"))
+chunk_size = 2048
+xres = 0.000179663056824
+yres = 0.000179663056824
 
+# function to extract PFT name from filename
 def extract_pft(fp):
-    """
-    Given a path like
-      ".../deciduous_shrub_30M-3C-IQR2_mosaic_clipped_masked.tif"
-    return "deciduous_shrub".
-    """
     base = os.path.splitext(os.path.basename(fp))[0]
     parts = base.split('_')
-    pft_parts = []
+    p = []
     for seg in parts:
-        # stop once you hit the measurement segment,
-        # which always starts with a digit (e.g. "30M-3C-IQR2")
         if seg and seg[0].isdigit():
             break
-        pft_parts.append(seg)
-    return '_'.join(pft_parts)
+        p.append(seg)
+    return '_'.join(p)
 
+# start by loading the water mask
+mask = rxr.open_rasterio(f"{dirpath}/water_mask_clipped.tif", band_as_variable=True)
+mask = mask.rename({"y": "lat", "x": "lon", "band_1": "water_mask"})
+del mask["spatial_ref"]
+for attr in ("scale_factor", "add_offset", "_FillValue"):
+    del mask["water_mask"].attrs[attr]
+del mask.attrs["AREA_OR_POINT"]
+
+# clear and set mask attributes
+mask["water_mask"].encoding.clear()
+mask["water_mask"].attrs.update({
+    "long_name": "Water Mask",
+    "standard_name": "status_flag",
+    "valid_range": [np.byte(0), np.byte(1)],
+    "flag_values": [np.byte(0), np.byte(1)],
+    "flag_meanings": "not_water water",
+})
+
+# loop through each tif
 for filepath in filepaths:
 
-    # convert tif to netcdf
+    # set pft name and output nc file name
     variable_name = extract_pft(filepath)
     nc_file = f"{dirpath}/{variable_name}_pavc-raster_arctic-alaska_summer-2019_v1-1.nc"
-    print(f'Converting {filepath} to {nc_file}...')
-    translate_options = gdal.TranslateOptions(format="netCDF", creationOptions=["FORMAT=NC4"])
-    gdal.UseExceptions()
-    gdal.Translate(nc_file, filepath, options=translate_options)
 
-    # load the new netcdf
-    print(f'Loading {nc_file} into xarray ...')
-    ds = xr.open_dataset(nc_file)
-    ds = ds.rename({'Band1': 'cover'})
-    ds['cover'] = ds['cover'].astype('float32')
-    ds.rio.write_crs(4326, inplace=True)
+    # read the tif as an xr dataset
+    print(f'Loading {filepath} into xarray and building NetCDF...')
+    ds = rxr.open_rasterio(filepath, band_as_variable=True)
+    ds = ds.chunk({"y": chunk_size, "x": chunk_size})
+    ds = ds.rename({
+        "x":"lon", 
+        "y": "lat",
+        "band_1":"cover"
+    })
+    # convert nodata of -9999 to 255
+    ds["cover"] = ds["cover"].where(ds["cover"] != -9999, 255)
+    # multiply values except 255 by 100 to convert to percent
+    ds["cover"] = ds["cover"].where(ds["cover"] == 255, ds["cover"] * 100)
+    ds["cover"] = ds["cover"].astype(np.uint8)
 
-    # create time bounds
+    # add long_name to cover and remove some attrs
+    ds["cover"].attrs["long_name"] = f"percent total cover of {variable_name}s"
+    for attr in ("scale_factor", "add_offset", "_FillValue"):
+        try:
+            del ds["cover"].attrs[attr]
+        except KeyError:
+            pass
+    del ds.attrs["AREA_OR_POINT"]
+    del ds["spatial_ref"]
+
+    # set cover encoding
+    cover_encoding = {
+        'dtype': 'uint8',
+        'zlib': True,
+        'complevel': 6,
+        'shuffle': True,
+        '_FillValue': np.uint8(255),
+        'chunksizes': (1, chunk_size, chunk_size)
+    }
+
+    # create time bounds xr data array
     print('Creating time bounds variable...')
     tb_arr = np.asarray(
         [
@@ -58,88 +98,66 @@ for filepath in filepaths:
         ]
     ).T
     tb_da = xr.DataArray(tb_arr, dims=("time", "nv"))
+    time_mid = tb_da.mean(dim="nv")
 
-    # create time dimension from bounds
+    # add time and time bounds
     print('Creating time dimension...')
-    ds = ds.expand_dims(time=tb_da.mean(dim="nv"))
+    ds = ds.expand_dims(time=time_mid)
     ds["time_bounds"] = tb_da
 
-    # set attributes lat/lon/time/time_bounds attrs
-    print('Editing attributes...')
-    ds["time"].attrs = {"axis": "T", "long_name": "time"}
-    ds["lat"].attrs = {"axis": "Y", "long_name": "latitude", "units": "degrees_north"}
-    ds["lat"] = ds["lat"].astype("float64")
-    ds["lon"].attrs = {"axis": "X", "long_name": "longitude", "units": "degrees_east"}
-    ds["lon"] = ds["lon"].astype("float64")
+    # add the water mask
+    print('Adding water mask...')
+    ds["water_mask"] = mask["water_mask"]
 
-    # sort lat/lon values
-    ds = ds.reindex(lat=list(reversed(ds.lat)))
+    # clean up time
+    print('Editing attributes...')
+    ds["time"].attrs = {
+        "axis": "T", 
+        "long_name": "time",
+        "standard_name": "time"}
+    ds["time"].encoding["units"] = f"days since {sdate.strftime('%Y-%m-%d %H:%M:%S')}"
+    ds["time"].encoding["calendar"] = "noleap"
+    ds["time"].encoding["bounds"] = "time_bounds"
+
+    # clean up lat and lon
+    ds = ds.reindex(lat=list(reversed(ds.lat))) # must do this BEFORE setting attrs
+    ds["lat"].attrs = {
+        "axis": "Y", 
+        "long_name": "latitude",
+        "standard_name": "latitude", 
+        "units": "degrees_north"}
+    ds["lon"].attrs = {
+        "axis": "X", 
+        "long_name": "longitude", 
+        "standard_name": "longitude",
+        "units": "degrees_east"}
 
     # set _FillValue to None for time, lat, lon
     for var in list(ds.coords) + [v for v in ds.data_vars if v != "cover"]:
-        ds[var].attrs["_FillValue"] = None
+        ds[var].encoding["_FillValue"] = None
 
     # add global attributes
-    print('Formatting the global attributes')
-    generate_stamp = time.strftime(
-        "%Y-%m-%d %H:%M:%S",
-        time.localtime(os.path.getmtime(f"{dirpath}/{variable_name}.tif")),
-    )
+    print('Formatting global attributes...')
     ds.attrs = {
         "title": f"Pan-Arctic Vegetation Cover (PAVC) Gridded: {variable_name.replace('_',' ')}",
         "version": "v1.1",
         "institution": "Oak Ridge National Laboratory",
         "source": ("Total fractional cover estimated by combining 20m Sentinel and ArcticDEM-derived "
-                   "predictors with high-quality plot samples based on fine-tuned random forest regression models"),
+                "predictors with high-quality plot samples based on fine-tuned random forest regression models"),
         "references": "",
         "comment": "The water mask identifies pixels where ndwi > 0 and ndvi <0.3",
         "Conventions": "CF-1.12",
     }
 
-    # add water mask
-    print(f'Opening water mask...')
-    mask = rxr.open_rasterio(f"{dirpath}/water_mask_clipped.tif", masked=True)
-    mask = mask.sel(band=1).drop_vars("band")
-    mask = mask.where(mask != 255)
-    mask = mask.rename({"y": "lat", "x": "lon"})
-    mask = mask.assign_coords(lat=ds.lat, lon=ds.lon)
-    mask = mask.astype("uint8")
-    ds["water_mask"] = mask
-
-    # set mask attributes
-    ds["water_mask"].attrs.update({
-        "long_name": "Water Mask",
-        "standard_name": "status_flag",
-        "valid_range": [np.byte(0), np.byte(1)],
-        "flag_values": [np.byte(0), np.byte(1)],
-        "flag_meanings": "not_water water",
-        "_FillValue": np.byte(255)
-    })
-
-    # set time encoding
-    print('Encoding time information...')
-    ds["time"].encoding["units"] = f"days since {sdate.strftime('%Y-%m-%d %H:%M:%S')}"
-    ds["time"].encoding["calendar"] = "noleap"
-    ds["time"].encoding["bounds"] = "time_bounds"
-
-    # set compression encoding
-    print('Encoding compression information...')
-    cover_encoding = {
-        'dtype': 'float32',
-        'zlib': True,
-        'complevel': 9,
-        'shuffle': True,           # helps compression
-        '_FillValue': np.float32(-9999)
-    }
-
     # set all encoding
+    print('Encoding...')
     encoding = {
         'cover': cover_encoding,
         'time': ds['time'].encoding,
         'lat': ds['lat'].encoding,
         'lon': ds['lon'].encoding,
         'time_bounds': ds['time_bounds'].encoding,
-        'water_mask': dict(dtype="uint8", _FillValue=255)
+        'water_mask': dict(dtype="byte", _FillValue=np.int8(-1))
     }
 
     # export
@@ -147,7 +165,8 @@ for filepath in filepaths:
     ds.to_netcdf(
         nc_file,
         format="NETCDF4",
-        encoding=encoding,
+        engine="netcdf4",
+        encoding=encoding
     )
 
     ds.close()

@@ -28,8 +28,8 @@ function ogr_extent() {
 #--------------------------------------------------------#
 
 # create vrt and subset data to study area-ish
-# vrt_name=${OUT_PATH}/${BAND}_mosaic_aoi.vrt
-# gdalbuildvrt $vrt_name $RASTERS
+vrt_name=${OUT_PATH}/${BAND}_mosaic_aoi.vrt
+gdalbuildvrt $vrt_name $RASTERS
 
 #--------------------------------------------------------#
 #--------------------------------------------------------#
@@ -57,23 +57,23 @@ function ogr_extent() {
 
 # try https://askubuntu.com/questions/1447474/how-to-use-sed-for-replacing-xml-tag-in-multiple-lines-xml-content-on-bash
 
-med_vrt_name=${OUT_PATH}/${BAND}_mosaic_aoi.vrt
-export GDAL_VRT_ENABLE_PYTHON=YES
+# med_vrt_name=${OUT_PATH}/${BAND}_mosaic_aoi.vrt
+# export GDAL_VRT_ENABLE_PYTHON=YES
 
-# clip to polygons
-for GRIDCELL in $GRIDCELLS; do
+# # clip to polygons
+# for GRIDCELL in $GRIDCELLS; do
 
-    echo Working on gridcell ${GRIDCELL}
-    filename=$(basename -- "$GRIDCELL")
-    name="${filename%.*}"
-    gdalwarp -overwrite \
-	-srcnodata $SRC_NODATA \
-	-dstnodata $DST_NODATA \
-	-crop_to_cutline -cutline $GRIDCELL \
-	-t_srs "+proj=longlat +datum=WGS84 +no_defs" \
-	-wo CUTLINE_ALL_TOUCHED=TRUE \
-	-wo NUM_THREADS=ALL_CPUS \
-	$med_vrt_name \
-	${OUT_PATH}/${name}_${BAND}.tif
+#     echo Working on gridcell ${GRIDCELL}
+#     filename=$(basename -- "$GRIDCELL")
+#     name="${filename%.*}"
+#     gdalwarp -overwrite \
+# 	-srcnodata $SRC_NODATA \
+# 	-dstnodata $DST_NODATA \
+# 	-crop_to_cutline -cutline $GRIDCELL \
+# 	-t_srs "+proj=longlat +datum=WGS84 +no_defs" \
+# 	-wo CUTLINE_ALL_TOUCHED=TRUE \
+# 	-wo NUM_THREADS=ALL_CPUS \
+# 	$med_vrt_name \
+# 	${OUT_PATH}/${name}_${BAND}.tif
 
-done
+# done
