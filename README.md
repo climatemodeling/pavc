@@ -9,6 +9,50 @@ This repository contains the jupyter notebooks (and supporting python modules) u
 - the National Ecological Observation Network,
 - and previously unpublished Seward Peninsula data from the Next Generation Ecosystem Experiments: Arctic (NGA).
 
+# Clone this repository
+Use a password-protected ssh key:
+```bash
+git clone https://github.com/climatemodeling/pavc.git
+```
+**_How to set up an ssh key:** https://docs.github.com/en/authentication/connecting-to-github-with-ssh
+
+## Dependencies (tested on Linux):
+This repository requires the following non-python standard libraries:
+- gdal 3.4.2
+- openmpi 5.0.5
+
+### Install openmpi (without sudo permissions):
+```bash
+cd $HOME
+wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-5.0.5.tar.gz
+tar -xvf openmpi-5.0.5.tar.gz
+cd openmpi-5.0.5
+INSTALL_PREFIX=$HOME/openmpi-5.0.5-install
+./configure --prefix=$INSTALL_PREFIX
+make -j8
+make install
+```
+
+### Install gdal (without sudo permissions):
+```bash
+cd $HOME
+wget https://download.osgeo.org/gdal/3.4.2/gdal-3.4.2.tar.gz
+tar -xvf gdal-3.4.2.tar.gz
+cd gdal-3.4.2
+export OPENMPI_DIR=$HOME/openmpi-5.0.5-install
+./configure --prefix=$HOME/gdal-3.4.2-install --with-openmpi=$OPENMPI_DIR
+make -j8
+make install
+```
+
+## Install python dependencies:
+We recommend using `uv` to manage your python environment. You can create a new environment with the required dependencies by running:
+```bash
+uv new -p python=3.9 alaska_pft_fcover_harmonization
+uv activate alaska_pft_fcover_harmonization
+uv pip install -r requirements.txt
+```
+
 # Contribution: How can you improve the database?
 
 These detailed Jupyter notebooks and helper functions were designed to streamline the process of synthesizing new datasets. Once tables have been formatted correctly, a new jupyter notebook can be written to synthesize data according to our standards. Notebooks provide detailed instructions and notes on how the data were pre-processed and synthesized using both automated and manual steps. If you come across issues in the notebooks, modules, or data, please publish an issue in this Github. We also welcome feedback and suggestions. We are always on the hunt for new data, so if you know of a dataset that isn't yet in the database that you'd like to see synthesized, please let us know!
