@@ -331,93 +331,95 @@ for gridcell in grid_list:
             logging.error(msg, exc_info=True)
             continue
 
-    # # get coordinate information from raster as df
-    # df = stacked_raster.to_dataframe()
-    # coords = df.reset_index()
-    # coords = coords[['x', 'y']]
+    # get coordinate information from raster as df
+    df = stacked_raster.to_dataframe()
+    coords = df.reset_index()
+    coords = coords[['x', 'y']]
 
-    # # get raster data as df
-    # df = df.droplevel([1, 2]).reset_index(drop=True)
-    # df = df.iloc[:,1:]
-    # # df = df.astype("float32")
+    # get raster data as df
+    df = df.droplevel([1, 2]).reset_index(drop=True)
+    df = df.iloc[:,1:]
+    # df = df.astype("float32")
     
-    # # find any bands that were divided by 0 and produced an inf value
-    # bad_idx_list = df[np.isinf(df.values)].index.tolist()
-    # df.drop(index=bad_idx_list, inplace=True)
-    # coords.drop(index=bad_idx_list, inplace=True)
+    # find any bands that were divided by 0 and produced an inf value
+    bad_idx_list = df[np.isinf(df.values)].index.tolist()
+    df.drop(index=bad_idx_list, inplace=True)
+    coords.drop(index=bad_idx_list, inplace=True)
 
-    # # remove straggling nans
-    # nan_idx_list = df[np.isnan(df.values)].index.tolist()
-    # df.drop(index=nan_idx_list, inplace=True)
-    # coords.drop(index=nan_idx_list, inplace=True)
+    # remove straggling nans
+    nan_idx_list = df[np.isnan(df.values)].index.tolist()
+    df.drop(index=nan_idx_list, inplace=True)
+    coords.drop(index=nan_idx_list, inplace=True)
 
-    # #########################################################################
-    # # Apply model
-    # #########################################################################
+    #########################################################################
+    # Apply model
+    #########################################################################
     
-    # for PFT in PFTS:
+    for PFT in PFTS:
 
-    #     entry = pft_file_map.get(PFT)
-    #     if entry is None:
-    #         logging.error(f"No mapping for PFT '{PFT}', skipping.")
-    #         continue
+        entry = pft_file_map.get(PFT)
+        if entry is None:
+            logging.error(f"No mapping for PFT '{PFT}', skipping.")
+            continue
         
-    #     try:
+        try:
 
-    #         # get pickle path
-    #         model_file_path = os.path.join(MODEL, "tunedModel_" + entry["model"])
-    #         if not os.path.isfile(model_file_path):
-    #             logging.critical(f"Model file not found: {model_file_path}. Exiting.")
-    #             sys.exit(1)
+            # get pickle path
+            model_file_path = os.path.join(MODEL, "tunedModel_" + entry["model"])
+            if not os.path.isfile(model_file_path):
+                logging.critical(f"Model file not found: {model_file_path}. Exiting.")
+                sys.exit(1)
 
-    #         # 2) Load the pickled model
-    #         with open(model_file_path, "rb") as f:
-    #             model = pickle.load(f)
+            # 2) Load the pickled model
+            with open(model_file_path, "rb") as f:
+                model = pickle.load(f)
 
-    #         # 3) Reorder df and predict
-    #         col_order = list(model.feature_names_in_)
-    #         df2 = df[col_order]
-    #         fcover = model.predict(df2)  # fcover is 1 × n
+            # 3) Reorder df and predict
+            col_order = list(model.feature_names_in_)
+            df2 = df[col_order]
+            fcover = model.predict(df2)  # fcover is 1 × n
 
-    #         # 4) Build output filename with suffix
-    #         pft_slug = PFT.replace(" ", "_")
-    #         tag      = entry["outfile_suffix"]
-    #         out_name = f"GRIDCELL_{gridcell}_{pft_slug}_{tag}.tif"
-    #         out_path = os.path.join(OUT_DIR, out_name)
+            # 4) Build output filename with suffix
+            pft_slug = PFT.replace(" ", "_")
+            tag      = entry["outfile_suffix"]
+            out_name = f"GRIDCELL_{gridcell}_{pft_slug}_{tag}.tif"
+            out_path = os.path.join(OUT_DIR, out_name)
             
-    #     except Exception as e:
-    #         msg = f"ERROR MODELLING FAILED FOR GRIDCELL {gridcell}, PFT '{PFT}': {e}"
-    #         print(msg)
-    #         logging.error(msg, exc_info=True)
-    #         continue
+        except Exception as e:
+            msg = f"ERROR MODELLING FAILED FOR GRIDCELL {gridcell}, PFT '{PFT}': {e}"
+            print(msg)
+            logging.error(msg, exc_info=True)
+            continue
 
         
-    #     #########################################################################
-    #     # Export modeled tif
-    #     #########################################################################
+        #########################################################################
+        # Export modeled tif
+        #########################################################################
 
-    #     # set up df for xarray
-    #     results = coords.copy()
-    #     results['fcover'] = fcover
-    #     results['band'] = 1
+        # set up df for xarray
+        results = coords.copy()
+        results['fcover'] = fcover
+        results['band'] = 1
         
-    #     # export xarray as tif
-    #     try:
-    #         results_xr = xr.Dataset.from_dataframe(results.set_index(['band', 'y', 'x']))
-    #         xr_band = results_xr.isel(band=0).rio.write_crs('EPSG:4326')
-    #         xr_band.rio.to_raster(out_path)
+        # export xarray as tif
+        try:
+            results_xr = xr.Dataset.from_dataframe(results.set_index(['band', 'y', 'x']))
+            xr_band = results_xr.isel(band=0).rio.write_crs('EPSG:4326')
+            xr_band.rio.to_raster(out_path)
 
-    #         msg = f"EXPORTED {out_path}"
-    #         print(msg)
-    #         logging.info(msg)
+            msg = f"EXPORTED {out_path}"
+            print(msg)
+            logging.info(msg)
             
-    #     except Exception as e:
-    #         msg = f"EXCEPTION WHILE EXPORTING FOR GRIDCELL {gridcell}, PFT '{PFT}': {e}"
-    #         print(msg)
-    #         logging.error(msg, exc_info=True)
-    #         continue
+        except Exception as e:
+            msg = f"EXCEPTION WHILE EXPORTING FOR GRIDCELL {gridcell}, PFT '{PFT}': {e}"
+            print(msg)
+            logging.error(msg, exc_info=True)
+            continue
             
-    #     # set crs
-    #     nodata_value = -9999
-    #     opts = gdal.WarpOptions(format='GTiff', dstSRS='EPSG:4326', dstNodata=nodata_value)
-    #     gdal.Warp(out_path, out_path, options=opts)
+        # set crs
+        tmp_path = out_path.replace(".tif", ".warp.tif")
+        opts = gdal.WarpOptions(format='GTiff', dstSRS='EPSG:4326', dstNodata=-9999)
+        ds = gdal.Warp(tmp_path, out_path, options=opts)
+        ds = None  # close dataset
+        os.replace(tmp_path, out_path)
