@@ -13,33 +13,34 @@ NODATA=-9999
 cd "$TIF_DIR"
 ls -1 $BASE_FILE > "$TIF_LIST"  # overwrites existing list
 
-# Step 1: Create VRT (Virtual Raster Table)
-gdalbuildvrt -input_file_list "$TIF_LIST" "${BAND}_merged.vrt"
+# # Step 1: Create VRT (Virtual Raster Table)
+# gdalbuildvrt -input_file_list "$TIF_LIST" "${BAND}_merged.vrt"
 
-# Step 2: Convert VRT to GeoTIFF with compression
-gdal_translate \
-  -of GTiff \
-  -ot Float32 \
-  -tr 0.000179663056824 0.000179663056824 \
-  -co TILED=YES \
-  -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 \
-  -co COMPRESS=DEFLATE \
-  -co ZLEVEL=9 \
-  -co PREDICTOR=3 \
-  -co BIGTIFF=YES \
-  -co NUM_THREADS=ALL_CPUS \
-  -a_nodata "$NODATA" \
-  "${BAND}_merged.vrt" \
-  "$OUT_DIR/$MOSAIC_NAME"
+# # Step 2: Convert VRT to GeoTIFF with compression
+# gdal_translate \
+#   -of GTiff \
+#   -ot Float32 \
+#   -tr 0.000179637521995 0.000179637521995 \
+#   -co TILED=YES \
+#   -co BLOCKXSIZE=512 -co BLOCKYSIZE=512 \
+#   -co COMPRESS=DEFLATE \
+#   -co ZLEVEL=9 \
+#   -co PREDICTOR=3 \
+#   -co BIGTIFF=YES \
+#   -co NUM_THREADS=ALL_CPUS \
+#   -a_nodata "$NODATA" \
+#   "${BAND}_merged.vrt" \
+#   "$OUT_DIR/$MOSAIC_NAME"
 
 # Step 3: Clip to polygon
 gdalwarp \
+  -overwrite \
   -srcnodata "$NODATA" \
   -dstnodata "$NODATA" \
   -crop_to_cutline -cutline "$POLY" \
-  -tr 0.000179663056824 0.000179663056824 \
+  -tr 0.000179637521995 0.000179637521995 \
   -tap \
-  -te -173.0516512 58.5499761 -141.0005449 71.3703468 \  # extent of PAVC gridded v1.1 files
+  -te -173.0516512 58.5499761 -141.0005449 71.3703468 \
   -co BIGTIFF=YES \
   -wo CUTLINE_ALL_TOUCHED=TRUE \
   -wo NUM_THREADS=ALL_CPUS \
